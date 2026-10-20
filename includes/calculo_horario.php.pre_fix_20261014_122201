@@ -1,0 +1,232 @@
+<?php
+/**
+ * ETAPA A v2.1 — Cálculo Horário CORRIGIDO
+ * - Usa ganho_solar (janelas reais) 
+ * - Condução: U×A×ΔT (sem fator errado)
+ * - Latitude NULL → default -23.55 (São Paulo)
+ * - Fatores ASHRAE para carga interna
+ */
+
+function posicao_solar($latitude, $dia_ano, $hora_solar) {
+    $declinacao = 23.45 * sin(deg2rad(360 * (284 + $dia_ano) / 365));
+    $angulo_horario = 15 * ($hora_solar - 12);
+    $sin_elev = sin(deg2rad($latitude)) * sin(deg2rad($declinacao))
+              + cos(deg2rad($latitude)) * cos(deg2rad($declinacao))
+              * cos(deg2rad($angulo_horario));
+    $elevacao = rad2deg(asin(max(-1, min(1, $sin_elev))));
+    if ($elevacao <= 0) return ['elevacao' => 0, 'azimute' => 0];
+    $cos_azim = (sin(deg2rad($declinacao)) - sin(deg2rad($latitude)) * sin(deg2rad($elevacao)))
+              / (cos(deg2rad($latitude)) * cos(deg2rad($elevacao)));
+    $cos_azim = max(-1, min(1, $cos_azim));
+    $azimute = rad2deg(acos($cos_azim));
+    if ($angulo_horario > 0) $azimute = 360 - $azimute;
+    return ['elevacao' => round($elevacao, 2), 'azimute' => round($azimute, 2)];
+}
+
+function irradiacao_vertical($irr_normal, $elevacao, $azimute_sol, $orientacao_parede) {
+    $diferenca = abs($azimute_sol - $orientacao_parede);
+    if ($diferenca > 180) $diferenca = 360 - $diferenca;
+    $cos_inc = max(0, cos(deg2rad($elevacao)) * cos(deg2rad($diferenca)));
+    $direta = $irr_normal * $cos_inc;
+    $difusa = $irr_normal * 0.30 * (1 + cos(deg2rad(90))) / 2;
+    return round($direta + $difusa, 2);
+}
+
+function irradiacao_normal_tipica($mes, $hora) {
+    $fator_mes = [0.85,0.90,0.95,1.00,1.05,1.10,1.10,1.05,1.00,0.95,0.90,0.85][$mes-1];
+    $fator_hora = max(0, 1 - pow(($hora - 13) / 6, 2));
+    return round(950 * $fator_mes * $fator_hora, 2);
+}
+
+function temp_externa_tipica($mes, $hora, $temp_pico) {
+    $variacao = 5 * sin(deg2rad(($hora - 9) * 15));
+    $fator_inverno = in_array($mes, [6,7,8]) ? 0.7 : 1.0;
+    return round($temp_pico + $variacao * $fator_inverno - 2, 1);
+}
+
+function normaliza_orientacao($s) {
+    $s = strtoupper(trim($s ?? 'N'));
+    if (strpos($s, 'NOR') !== false) return 'N';
+    if (strpos($s, 'SUL') !== false || strpos($s, 'SOU') !== false) return 'S';
+    if (strpos($s, 'LES') !== false || strpos($s, 'EAS') !== false) return 'L';
+    if (strpos($s, 'OES') !== false || strpos($s, 'WES') !== false) return 'O';
+    if (strpos($s, 'NAS') !== false) return 'L';
+    if (strpos($s, 'POE') !== false) return 'O';
+    return substr($s, 0, 1);
+}
+
+
+/**
+ * ETAPA C — Consulta CRESESB
+ * Retorna irradiação diária (kWh/m²/dia) por orientação para a cidade
+ */
+function buscar_irradiacao_cresesb($conn, $cidade, $uf) {
+    if (empty($cidade) || empty($uf)) return null;
+    $cidade_esc = $conn->real_escape_string($cidade);
+    $uf_esc = $conn->real_escape_string($uf);
+    $r = $conn->query("
+        SELECT * FROM irradiacao_cresesb 
+        WHERE cidade = '$cidade_esc' AND uf = '$uf_esc' AND ativo = 1
+        LIMIT 1
+    ");
+    if ($r && $r->num_rows > 0) return $r->fetch_assoc();
+    return null;
+}
+
+/**
+ * Converte perfil mensal CRESESB para irradiação W/m² na hora
+ */
+function irradiacao_cresesb_hora($perfil_json, $orientacao, $mes, $hora) {
+    if (empty($perfil_json)) return null;
+    $perfil = json_decode($perfil_json, true);
+    if (!$perfil || !isset($perfil[$orientacao])) return null;
+    
+    $meses = $perfil[$orientacao];
+    if (!isset($meses[$mes - 1])) return null;
+    
+    // kWh/m²/dia → W/m² pico (considera ~6h de sol útil)
+    $media_dia_kwh = (float)$meses[$mes - 1];
+    $pico_w_m2 = ($media_dia_kwh * 1000) / 5.5; // 5.5h equivalentes
+    
+    // Distribuição ao longo do dia (curva senoidal entre 6h e 18h)
+    if ($hora < 6 || $hora > 18) return 0;
+    $fator_hora = sin(deg2rad(($hora - 6) / 12 * 180));
+    return round($pico_w_m2 * $fator_hora, 2);
+}
+
+function calcular_perfil_horario($conn, $ambiente_id) {
+    $stmt = $conn->prepare("
+        SELECT a.*, p.latitude, p.cidade, p.uf, p.temp_externa_verao
+        FROM ambientes a
+        JOIN projetos p ON p.id = a.projeto_id
+        WHERE a.id = ?
+    ");
+    $stmt->bind_param('i', $ambiente_id);
+    $stmt->execute();
+    $amb = $stmt->get_result()->fetch_assoc();
+    $stmt->close();
+    
+    if (!$amb) return ['erro' => 'Ambiente não encontrado'];
+    
+    $area_piso = floatval($amb['comprimento_m']) * floatval($amb['largura_m']);
+    $altura    = floatval($amb['peDireita_m'] ?? 2.8);
+    $latitude  = floatval($amb['latitude'] ?? -23.55);
+    if ($latitude == 0) $latitude = -23.55;
+    $temp_int  = floatval($amb['temp_interna'] ?? 24.0);
+    $temp_pico = floatval($amb['temp_externa'] ?? $amb['temp_externa_verao'] ?? 32.0);
+    
+    $ganhos = [];
+    $r = $conn->query("SELECT * FROM ganho_solar WHERE ambiente_id = $ambiente_id");
+    if ($r) { while ($row = $r->fetch_assoc()) $ganhos[] = $row; }
+    
+    $paredes = [];
+    $r = $conn->query("SELECT * FROM paredes WHERE ambiente_id = $ambiente_id");
+    if ($r) { while ($row = $r->fetch_assoc()) $paredes[] = $row; }
+    
+    $tem_parede_valida = false;
+    foreach ($paredes as $p) {
+        if (floatval($p['area_m2'] ?? 0) > 0) { $tem_parede_valida = true; break; }
+    }
+    
+    $perimetro = 2 * (floatval($amb['comprimento_m']) + floatval($amb['largura_m']));
+    $area_env_teorica = $perimetro * $altura - floatval($amb['area_vidro_m2'] ?? 0);
+    
+    $conn->query("DELETE FROM carga_horaria WHERE ambiente_id = $ambiente_id");
+    
+    $stmt_ins = $conn->prepare("
+        INSERT INTO carga_horaria 
+        (ambiente_id, mes, hora, elevacao_sol, azimute_sol,
+         irr_norte, irr_sul, irr_leste, irr_oeste,
+         carga_solar_w, carga_interna_w, carga_conducao_w, carga_total_w, temp_externa_c)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+    ");
+    
+    $pico = ['carga' => 0, 'mes' => 0, 'hora' => 0];
+    
+    for ($mes = 1; $mes <= 12; $mes++) {
+        $dia_ano = ($mes - 1) * 30 + 15;
+        for ($hora = 6; $hora <= 18; $hora++) {
+            $sol = posicao_solar($latitude, $dia_ano, $hora);
+            // ETAPA C — tenta CRESESB primeiro
+            $perfil = buscar_irradiacao_cresesb($conn, $amb['cidade'] ?? '', $amb['uf'] ?? '');
+            if ($perfil) {
+                // Usa CRESESB
+                $irr_norm_cresesb = irradiacao_cresesb_hora($perfil['perfil_mensal'], 'plano', $mes, $hora);
+                $irr_norm = $irr_norm_cresesb !== null ? $irr_norm_cresesb : irradiacao_normal_tipica($mes, $hora);
+                $fonte_irr = 'CRESESB';
+            } else {
+                $irr_norm = irradiacao_normal_tipica($mes, $hora);
+                $fonte_irr = 'teórico';
+            }
+            
+            $irr = [
+                'N' => irradiacao_vertical($irr_norm, $sol['elevacao'], $sol['azimute'], 0),
+                'L' => irradiacao_vertical($irr_norm, $sol['elevacao'], $sol['azimute'], 90),
+                'S' => irradiacao_vertical($irr_norm, $sol['elevacao'], $sol['azimute'], 180),
+                'O' => irradiacao_vertical($irr_norm, $sol['elevacao'], $sol['azimute'], 270),
+            ];
+            
+            // CARGA SOLAR
+            $carga_solar = 0;
+            foreach ($ganhos as $g) {
+                $orient = normaliza_orientacao($g['orientacao'] ?? 'N');
+                $area_v = floatval($g['area_vidro_m2'] ?? 0);
+                $trans  = floatval($g['transmissividade'] ?? 0.85);
+                $fs     = floatval($g['fator_sombra'] ?? 1.0);
+                $shgc = $trans * $fs;
+                $carga_solar += ($irr[$orient] ?? 0) * $area_v * $shgc;
+            }
+            
+            // CARGA INTERNA
+            $pessoas = intval($amb['pessoas'] ?? 1);
+            $carga_pessoas = $pessoas * 130;
+            $pot_ilum = floatval($amb['potencia_iluminacao_w'] ?? 100);
+            $fator_ilum = ($hora >= 8 && $hora <= 18) ? 1.0 : 0.2;
+            $carga_ilum = $pot_ilum * $fator_ilum;
+            $pot_equip = floatval($amb['potencia_equipamentos_w'] ?? 150);
+            $fator_equip = ($hora >= 8 && $hora <= 22) ? 1.0 : 0.3;
+            $carga_equip = $pot_equip * $fator_equip;
+            $carga_interna = $carga_pessoas + $carga_ilum + $carga_equip;
+            
+            // CONDUÇÃO
+            $temp_ext_h = temp_externa_tipica($mes, $hora, $temp_pico);
+            $delta_t = $temp_ext_h - $temp_int;
+            
+            $carga_conducao = 0;
+            if ($tem_parede_valida) {
+                foreach ($paredes as $p) {
+                    if (intval($p['do_lado_exterior']) != 1) continue;
+                    $area_p = floatval($p['area_m2'] ?? 0);
+                    $u_p = floatval($p['coeficiente_transmissao_k'] ?? 1.75);
+                    $carga_conducao += max(0, $delta_t) * $area_p * $u_p;
+                }
+            } else {
+                $u_medio = 2.0;
+                $carga_conducao = max(0, $delta_t) * $area_env_teorica * $u_medio;
+            }
+            
+            $carga_total = $carga_solar + $carga_interna + $carga_conducao;
+            
+            if ($carga_total > $pico['carga']) {
+                $pico = ['carga' => $carga_total, 'mes' => $mes, 'hora' => $hora];
+            }
+            
+            $stmt_ins->bind_param('iiiidddddddddd',
+                $ambiente_id, $mes, $hora,
+                $sol['elevacao'], $sol['azimute'],
+                $irr['N'], $irr['S'], $irr['L'], $irr['O'],
+                $carga_solar, $carga_interna, $carga_conducao, $carga_total, $temp_ext_h
+            );
+            $stmt_ins->execute();
+        }
+    }
+    $stmt_ins->close();
+    
+    return [
+        'sucesso' => true, 
+        'pico' => $pico, 
+        'area' => $area_piso,
+        'janelas' => count($ganhos),
+        'paredes' => count($paredes)
+    ];
+}

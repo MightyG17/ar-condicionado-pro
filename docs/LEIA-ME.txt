@@ -1,0 +1,25 @@
+====================================================================
+   AR CONDICIONADO PRO
+   Baseado em Wilbert & Stoecker — Atualizado com NBR
+====================================================================
+
+ESTRUTURA:
+  ar_condicionado_pro/
+  ├── banco/          → Script do MySQL
+  ├── config/         → Conexão
+  ├── paginas/        → Páginas do sistema
+  ├── assets/css/     → Estilos
+  └── docs/           → Documentação
+
+COMO USAR:
+1. Importar o banco:
+   mysql -u root -p < banco/criar_banco.sql
+
+2. Editar config/config.php — colocar sua senha do MySQL
+
+3. Mover a pasta para htdocs ou www do Apache
+
+4. Acessar:
+   http://localhost/ar_condicionado_pro/paginas/
+
+====================================================================

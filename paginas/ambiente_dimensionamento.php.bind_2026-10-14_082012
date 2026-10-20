@@ -1,0 +1,559 @@
+<?php
+error_reporting(E_ALL);
+ini_set('display_errors', 1);
+include __DIR__ . "/../config/config.php";
+
+// ============================================================
+// CARREGAR PROJETO E AMBIENTE
+// ============================================================
+$projeto_id = (int)($_GET['projeto_id'] ?? 0);
+$ambiente_id = (int)($_GET['ambiente_id'] ?? 0);
+if (!$projeto_id || !$ambiente_id) { header("Location: residencial_ambiente.php"); exit; }
+
+$proj = $conn->query("SELECT * FROM projetos WHERE id = $projeto_id")->fetch_assoc();
+$amb = $conn->query("SELECT * FROM ambientes WHERE id = $ambiente_id AND projeto_id = $projeto_id")->fetch_assoc();
+if (!$proj || !$amb) { header("Location: residencial_ambiente.php?projeto_id=$projeto_id"); exit; }
+
+function val($arr, $chave, $padrao = '') {
+    return isset($arr[$chave]) ? $arr[$chave] : $padrao;
+}
+
+$mensagem_sucesso = '';
+
+// ============================================================
+// CONSTANTES TÉCNICAS
+// ============================================================
+$IRRADIACAO_SOLAR = [
+    'Norte'    => 550, 'Nordeste' => 520, 'Leste' => 600, 'Sudeste' => 400,
+    'Sul'      => 200, 'Sudoeste' => 500, 'Oeste' => 700, 'Noroeste' => 620,
+];
+
+$TIPO_VIDRO = [
+    'comum'     => ['U' => 5.8, 'tau' => 0.85],
+    'duplo'     => ['U' => 2.8, 'tau' => 0.70],
+    'low_e'     => ['U' => 1.5, 'tau' => 0.40],
+    'temperado' => ['U' => 5.5, 'tau' => 0.78],
+    'laminado'  => ['U' => 5.5, 'tau' => 0.75],
+    'refletivo' => ['U' => 5.5, 'tau' => 0.35],
+];
+
+$COEF_U_MATERIAIS = [
+    'Tijolo cerâmico 1/2 vez' => 2.40, 'Tijolo cerâmico 1 vez' => 1.70,
+    'Bloco de concreto' => 2.80, 'Concreto maciço' => 3.50,
+    'Madeira' => 0.60, 'Drywall' => 1.80, 'Vidro' => 5.80, 'Outro' => 2.00,
+];
+
+$EQUIPAMENTOS_COMERCIAIS = [
+    7000, 9000, 10000, 12000, 15000, 18000, 22000, 24000, 30000, 36000, 48000
+];
+
+$delta_T = (float)val($proj, 'temp_externa_verao', 32.0) - (float)val($proj, 'temp_interna_verao', 24.0);
+$delta_T_ar = 10.0; // °C — temperatura de insuflamento
+$margem_seguranca = 0.10; // 10%
+
+// ============================================================
+// DADOS DO AMBIENTE (Etapa 1)
+// ============================================================
+$comp_amb = (float)val($amb, 'comprimento_m', 0);
+$larg_amb = (float)val($amb, 'largura_m', 0);
+$pe_direito = (float)val($amb, 'peDireita_m', 2.8);
+$area_ambiente = $comp_amb * $larg_amb;
+$volume_ambiente = $area_ambiente * $pe_direito;
+
+// ============================================================
+// 1. CONDUÇÃO + RADIAÇÃO — PAREDES (Etapa 2 + 3)
+// ============================================================
+$Q_paredes_cond = 0;
+$Q_paredes_rad = 0;
+$paredes = [];
+
+$res_p = $conn->query("SELECT * FROM paredes_ambiente WHERE ambiente_id = $ambiente_id");
+while ($p = $res_p->fetch_assoc()) {
+    $comp = (float)($p['comprimento_m'] ?? 0);
+    $alt = (float)($p['altura_m'] ?? 0);
+    if ($comp <= 0 || $alt <= 0) continue;
+    
+    $area = $comp * $alt;
+    $U = $COEF_U_MATERIAIS[$p['material']] ?? 2.0;
+    $alpha = (float)($p['coef_absorcao_solar'] ?? 0.30);
+    $I = $IRRADIACAO_SOLAR[$p['nome']] ?? 400;
+    
+    $q_cond = $U * $area * $delta_T;
+    // CLTD — Cooling Load Temperature Difference (ASHRAE Fundamentals)
+                    // Já inclui o efeito da radiação solar para cada orientação + cor
+                    $CLTD_TABELA = [
+                        'Norte'    => [5, 6, 7],
+                        'Nordeste' => [7, 9, 11],
+                        'Leste'    => [9, 11, 13],
+                        'Sudeste'  => [6, 8, 9],
+                        'Sul'      => [4, 4, 5],
+                        'Sudoeste' => [8, 10, 12],
+                        'Oeste'    => [11, 13, 16],
+                        'Noroeste' => [9, 11, 13],
+                    ];
+                    $idx_cor = 0;
+                    if (($p['cor_externa'] ?? 'Clara') === 'Média') $idx_cor = 1;
+                    elseif (($p['cor_externa'] ?? 'Clara') === 'Escura') $idx_cor = 2;
+                    $CLTD = $CLTD_TABELA[$p['nome']][$idx_cor] ?? 8;
+                    $q_rad = $U * $area * $CLTD;
+    
+    $Q_paredes_cond += $q_cond;
+    $Q_paredes_rad += $q_rad;
+    
+    $paredes[] = [
+        'nome' => $p['nome'], 'area' => $area, 'material' => $p['material'],
+        'U' => $U, 'alpha' => $alpha, 'I' => $I,
+        'q_cond' => $q_cond, 'q_rad' => $q_rad, 'q_total' => $q_cond + $q_rad,
+    ];
+}
+
+// ============================================================
+// 2. CONDUÇÃO + RADIAÇÃO — JANELAS (Etapa 2 + 3)
+// ============================================================
+$Q_janelas_cond = 0;
+$Q_janelas_rad = 0;
+$Q_infiltracao_total = 0;
+$janelas = [];
+
+// Carrega configurações de ganho_solar
+$config_solar = [];
+$res_gs = $conn->query("SELECT * FROM ganho_solar WHERE ambiente_id = $ambiente_id");
+while ($gs = $res_gs->fetch_assoc()) {
+    $config_solar[(int)$gs['item_id']] = $gs;
+}
+
+$res_i = $conn->query("
+    SELECT ip.*, pa.nome AS orientacao_parede
+    FROM itens_parede ip
+    JOIN paredes_ambiente pa ON pa.id = ip.parede_id
+    WHERE pa.ambiente_id = $ambiente_id
+");
+while ($it = $res_i->fetch_assoc()) {
+    $larg = (float)($it['largura_m'] ?? 0);
+    $alt = (float)($it['altura_m'] ?? 0);
+    $area = $larg * $alt;
+    if ($area <= 0) continue;
+    
+    $orientacao = $it['orientacao_parede'] ?? 'Norte';
+    $I = $IRRADIACAO_SOLAR[$orientacao] ?? 400;
+    
+    $cfg = $config_solar[(int)$it['id']] ?? null;
+    $tipo_vidro = $cfg['tipo_vidro'] ?? 'comum';
+    $fator_sombra = (float)($cfg['fator_sombra'] ?? 1.0);
+    
+    if (!isset($TIPO_VIDRO[$tipo_vidro])) $tipo_vidro = 'comum';
+    $U_vidro = $TIPO_VIDRO[$tipo_vidro]['U'];
+    $tau = $TIPO_VIDRO[$tipo_vidro]['tau'];
+    
+    $q_cond = $U_vidro * $area * $delta_T;
+    $q_rad = $tau * $I * $area * $fator_sombra;
+    $q_inf = (float)($it['carga_infiltracao_w'] ?? 0);
+    
+    $Q_janelas_cond += $q_cond;
+    $Q_janelas_rad += $q_rad;
+    $Q_infiltracao_total += $q_inf;
+    
+    $janelas[] = [
+        'nome' => $it['nome_item'], 'tipo' => $it['tipo_item'],
+        'orientacao' => $orientacao, 'area' => $area,
+        'tipo_vidro' => $tipo_vidro, 'fator_sombra' => $fator_sombra,
+        'q_cond' => $q_cond, 'q_rad' => $q_rad, 'q_inf' => $q_inf,
+        'q_total' => $q_cond + $q_rad + $q_inf,
+    ];
+}
+
+// ============================================================
+// 3. INFILTRAÇÃO — Separação sensível/latente
+// ============================================================
+// 75% sensível / 25% latente (aproximação)
+$Q_inf_sens = $Q_infiltracao_total * 0.75;
+$Q_inf_lat = $Q_infiltracao_total * 0.25;
+
+// ============================================================
+// 4. CARGAS INTERNAS (Etapa 4)
+// ============================================================
+$ci = $conn->query("SELECT * FROM cargas_internas WHERE ambiente_id = $ambiente_id LIMIT 1")->fetch_assoc();
+
+$Q_int_sens = 0;
+$Q_int_lat = 0;
+$cargas_detalhe = [];
+
+if ($ci) {
+    // Pessoas
+    $q_pessoas = (int)($ci['pessoas'] ?? 0) * (float)($ci['calor_por_pessoa_w'] ?? 115) * (float)($ci['fator_simultaneidade_pessoas'] ?? 0.90);
+    $q_pessoas_sens = $q_pessoas * 0.58;
+    $q_pessoas_lat = $q_pessoas * 0.42;
+    
+    // Iluminação
+    $q_ilum = (float)($ci['potencia_iluminacao_w'] ?? 0) * (float)($ci['fator_simultaneidade_iluminacao'] ?? 1.0);
+    $q_ilum_sens = $q_ilum;
+    $q_ilum_lat = 0;
+    
+    // Equipamentos
+    $q_equip = (float)($ci['potencia_equipamentos_w'] ?? 0) * (float)($ci['fator_simultaneidade_equipamentos'] ?? 0.70);
+    $q_equip_sens = $q_equip * 0.70;
+    $q_equip_lat = $q_equip * 0.30;
+    
+    $Q_int_sens = $q_pessoas_sens + $q_ilum_sens + $q_equip_sens;
+    $Q_int_lat = $q_pessoas_lat + $q_ilum_lat + $q_equip_lat;
+    
+    $cargas_detalhe = [
+        'pessoas' => ['sens' => $q_pessoas_sens, 'lat' => $q_pessoas_lat, 'total' => $q_pessoas],
+        'iluminacao' => ['sens' => $q_ilum_sens, 'lat' => $q_ilum_lat, 'total' => $q_ilum],
+        'equipamentos' => ['sens' => $q_equip_sens, 'lat' => $q_equip_lat, 'total' => $q_equip],
+    ];
+}
+
+// ============================================================
+// 5. BALANÇO TÉRMICO TOTAL
+// ============================================================
+$Q_sensivel_total = $Q_paredes_cond + $Q_paredes_rad + $Q_janelas_cond + $Q_janelas_rad + $Q_inf_sens + $Q_int_sens;
+$Q_latente_total = $Q_inf_lat + $Q_int_lat;
+$Q_total = $Q_sensivel_total + $Q_latente_total;
+
+// SHR
+$SHR = $Q_total > 0 ? $Q_sensivel_total / $Q_total : 1.0;
+
+// Vazão de ar (Q_sens = ρ · cp · V · ΔT)
+$vazao_m3_s = $Q_sensivel_total / (1.2 * 1005 * $delta_T_ar);
+$vazao_m3_h = $vazao_m3_s * 3600;
+
+// Capacidade
+$Q_com_margem = $Q_total * (1 + $margem_seguranca);
+$margem_w = $Q_com_margem - $Q_total;
+$BTU_h = $Q_com_margem * 3.412;
+$TR = $Q_com_margem / 3517;
+
+// Equipamento sugerido
+$equip_sugerido = end($EQUIPAMENTOS_COMERCIAIS);
+foreach ($EQUIPAMENTOS_COMERCIAIS as $cap) {
+    if ($cap >= $BTU_h) { $equip_sugerido = $cap; break; }
+}
+$equip_nome = "Split " . number_format($equip_sugerido, 0, ',', '.') . " BTU/h";
+
+// Avaliação do SHR
+if ($SHR >= 0.85) $shr_status = ['texto' => 'Seco / Padrão', 'cor' => '#10b981'];
+elseif ($SHR >= 0.75) $shr_status = ['texto' => 'Ideal', 'cor' => '#10b981'];
+elseif ($SHR >= 0.65) $shr_status = ['texto' => 'Úmido / Desumidificação', 'cor' => '#f59e0b'];
+else $shr_status = ['texto' => 'Muito Úmido / Cuidado', 'cor' => '#ef4444'];
+
+// ============================================================
+// SALVAR POST
+// ============================================================
+if ($_SERVER["REQUEST_METHOD"] === "POST" && !empty($_POST['salvar_dimensionamento'])) {
+    // Limpa resultado anterior
+    $conn->query("DELETE FROM resultados_calculo WHERE ambiente_id = $ambiente_id AND projeto_id = $projeto_id");
+    
+    $stmt = $conn->prepare("INSERT INTO resultados_calculo 
+        (projeto_id, ambiente_id, carga_conducao_w, carga_solar_w, carga_interna_w,
+         carga_ventilacao_w, carga_bruta_w, margem_seguranca_w, carga_total_w,
+         carga_sensivel_w, carga_latente_w, shr, vazao_ar_m3h,
+         carga_total_btu, aparelho_recomendado, delta_t_c, volume_m3)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+    
+    $q_conducao = $Q_paredes_cond + $Q_janelas_cond;
+    $q_solar = $Q_paredes_rad + $Q_janelas_rad;
+    $q_interna = $Q_int_sens + $Q_int_lat;
+    $q_ventilacao = $Q_infiltracao_total;
+    $q_bruta = $Q_total;
+    $q_total_final = $Q_com_margem;
+    $btu_final = $BTU_h;
+    
+    // 17 campos: i i d d d d d d d d d d d d d s d
+    $stmt->bind_param("iidddddddddddddsd",
+        $projeto_id, $ambiente_id,
+        $q_conducao, $q_solar, $q_interna, $q_ventilacao,
+        $q_bruta, $margem_w, $q_total_final,
+        $Q_sensivel_total, $Q_latente_total, $SHR, $vazao_m3_h,
+        $btu_final, $equip_nome, $delta_T, $volume_ambiente
+    );
+    
+    if (!$stmt->execute()) {
+        error_log("Erro INSERT resultados_calculo: " . $stmt->error);
+    }
+    
+    if (empty($_POST['salvar_apenas'])) {
+        header("Location: ambiente_resultado.php?projeto_id=$projeto_id&ambiente_id=$ambiente_id");
+        exit;
+    } else {
+        $mensagem_sucesso = "Dimensionamento salvo com sucesso!";
+    }
+}
+?>
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Passo 5 — Dimensionamento</title>
+<style>
+* { box-sizing:border-box; font-family:system-ui,sans-serif; margin:0; padding:0; }
+body { background:#f0f4f8; padding:20px; max-width:1200px; margin:0 auto; }
+.barra-progresso { display:flex; justify-content:space-between; margin-bottom:24px; }
+.passo-link { flex:1; text-align:center; font-size:0.75rem; color:#94a3b8; border-bottom:2px solid #e2e8f0; padding-bottom:8px; text-decoration:none; }
+.passo-link.ativo { color:#06b6d4; border-bottom:3px solid #06b6d4; font-weight:700; }
+.passo-link.concluido { color:#2563eb; border-bottom:2px solid #bfdbfe; }
+.cabecalho { background:#fff; padding:24px; border-radius:12px; box-shadow:0 2px 8px rgba(0,0,0,0.05); margin-bottom:24px; }
+h1 { font-size:1.3rem; color:#1e293b; margin-bottom:5px; }
+h2 { font-size:1.1rem; color:#334155; margin-bottom:16px; padding-bottom:8px; border-bottom:2px solid #e2e8f0; }
+.subtitulo { color:#64748b; margin-bottom:12px; }
+.form-card { background:#fff; padding:24px; border-radius:12px; box-shadow:0 2px 8px rgba(0,0,0,0.05); margin-bottom:20px; }
+.btn { padding:12px 24px; border-radius:10px; font-weight:700; text-decoration:none; border:none; cursor:pointer; font-size:0.95rem; display:inline-flex; align-items:center; gap:6px; }
+.btn-voltar { background:#e5e7eb; color:#374151; }
+.btn-proximo { background:linear-gradient(135deg, #06b6d4, #0891b2); color:#fff; }
+.btn-salvar { background:linear-gradient(135deg, #10b981, #059669); color:#fff; }
+.botoes { display:flex; gap:12px; margin-top:24px; justify-content:space-between; padding-top:20px; border-top:2px solid #e2e8f0; flex-wrap:wrap; }
+.aviso-sucesso { background:#d1fae5; border-left:4px solid #10b981; padding:14px 18px; margin-bottom:16px; border-radius:8px; color:#065f46; font-weight:600; }
+table { width:100%; border-collapse:collapse; margin-top:8px; }
+th { background:#f1f5f9; padding:10px 12px; text-align:left; font-weight:700; color:#475569; font-size:0.8rem; text-transform:uppercase; }
+td { padding:10px 12px; border-bottom:1px solid #e2e8f0; font-size:0.9rem; color:#334155; }
+tfoot td { background:#f1f5f9; font-weight:700; color:#0f172a; }
+.resumo-box { background:linear-gradient(135deg, #cffafe, #a5f3fc); border-radius:12px; padding:24px; margin:24px 0; }
+.card-grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(200px, 1fr)); gap:16px; margin-top:16px; }
+.card { background:#fff; padding:18px; border-radius:8px; box-shadow:0 1px 3px rgba(0,0,0,0.05); }
+.card-label { font-size:0.75rem; font-weight:700; text-transform:uppercase; letter-spacing:0.5px; margin-bottom:6px; }
+.card-valor { font-size:1.6rem; font-weight:800; }
+.card-sub { font-size:0.75rem; color:#64748b; margin-top:4px; }
+.destaque { background:linear-gradient(135deg, #06b6d4, #0891b2); color:#fff; padding:24px; border-radius:12px; text-align:center; margin:24px 0; }
+.destaque h3 { font-size:0.9rem; text-transform:uppercase; letter-spacing:1px; opacity:0.9; margin-bottom:8px; }
+.destaque .valor { font-size:2.2rem; font-weight:800; }
+.destaque .sub { font-size:0.9rem; margin-top:8px; opacity:0.95; }
+</style>
+</head>
+<body>
+
+<div class="barra-progresso">
+    <a href="ambiente_dados.php?projeto_id=<?= $projeto_id ?>&ambiente_id=<?= $ambiente_id ?>" class="passo-link concluido">✓ 1. Dados</a>
+    <a href="ambiente_paredes.php?projeto_id=<?= $projeto_id ?>&ambiente_id=<?= $ambiente_id ?>" class="passo-link concluido">✓ 2. Paredes</a>
+    <a href="ambiente_ganho_solar.php?projeto_id=<?= $projeto_id ?>&ambiente_id=<?= $ambiente_id ?>" class="passo-link concluido">✓ 3. Solar</a>
+    <a href="ambiente_cargas_internas.php?projeto_id=<?= $projeto_id ?>&ambiente_id=<?= $ambiente_id ?>" class="passo-link concluido">✓ 4. Internas</a>
+    <a class="passo-link ativo">5. Dimensionamento</a>
+    <a class="passo-link">6. Resultado</a>
+</div>
+
+<div class="cabecalho">
+    <a href="ambiente_cargas_internas.php?projeto_id=<?= $projeto_id ?>&ambiente_id=<?= $ambiente_id ?>" style="color:#06b6d4; text-decoration:none; font-weight:600; font-size:0.9rem;">← Voltar ao Passo 4</a>
+    
+    <?php if (!empty($mensagem_sucesso)): ?>
+    <div class="aviso-sucesso" style="margin-top:16px;">✅ <?= htmlspecialchars($mensagem_sucesso) ?></div>
+    <?php endif; ?>
+    
+    <h1 style="margin-top:16px;">❄️ Dimensionamento Térmico</h1>
+    <p class="subtitulo">
+        Ambiente: <strong><?= htmlspecialchars(val($amb, 'nome')) ?></strong>
+        · Área: <?= number_format($area_ambiente, 1, ',', '.') ?> m²
+        · Volume: <?= number_format($volume_ambiente, 1, ',', '.') ?> m³
+        · ΔT: <?= number_format($delta_T, 1, ',', '.') ?> °C
+    </p>
+</div>
+
+<!-- ============================================================ -->
+<!-- BALANÇO TÉRMICO -->
+<!-- ============================================================ -->
+<div class="form-card">
+    <h2>📊 Balanço Térmico Completo</h2>
+    
+    <table>
+        <thead>
+            <tr>
+                <th>Fonte de Calor</th>
+                <th style="text-align:right;">Q_sensível (W)</th>
+                <th style="text-align:right;">Q_latente (W)</th>
+                <th style="text-align:right;">Q_total (W)</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>🧱 Condução — Paredes</td>
+                <td style="text-align:right;"><?= number_format($Q_paredes_cond, 1, ',', '.') ?></td>
+                <td style="text-align:right;">0,0</td>
+                <td style="text-align:right; font-weight:600;"><?= number_format($Q_paredes_cond, 1, ',', '.') ?></td>
+            </tr>
+            <tr>
+                <td>☀️ Radiação — Paredes</td>
+                <td style="text-align:right;"><?= number_format($Q_paredes_rad, 1, ',', '.') ?></td>
+                <td style="text-align:right;">0,0</td>
+                <td style="text-align:right; font-weight:600;"><?= number_format($Q_paredes_rad, 1, ',', '.') ?></td>
+            </tr>
+            <tr>
+                <td>🪟 Condução — Janelas</td>
+                <td style="text-align:right;"><?= number_format($Q_janelas_cond, 1, ',', '.') ?></td>
+                <td style="text-align:right;">0,0</td>
+                <td style="text-align:right; font-weight:600;"><?= number_format($Q_janelas_cond, 1, ',', '.') ?></td>
+            </tr>
+            <tr>
+                <td>☀️ Radiação — Janelas</td>
+                <td style="text-align:right;"><?= number_format($Q_janelas_rad, 1, ',', '.') ?></td>
+                <td style="text-align:right;">0,0</td>
+                <td style="text-align:right; font-weight:600;"><?= number_format($Q_janelas_rad, 1, ',', '.') ?></td>
+            </tr>
+            <tr>
+                <td>💨 Infiltração de ar</td>
+                <td style="text-align:right;"><?= number_format($Q_inf_sens, 1, ',', '.') ?></td>
+                <td style="text-align:right;"><?= number_format($Q_inf_lat, 1, ',', '.') ?></td>
+                <td style="text-align:right; font-weight:600;"><?= number_format($Q_infiltracao_total, 1, ',', '.') ?></td>
+            </tr>
+            <?php if (!empty($cargas_detalhe)): ?>
+            <tr>
+                <td>👥 Ocupantes</td>
+                <td style="text-align:right;"><?= number_format($cargas_detalhe['pessoas']['sens'], 1, ',', '.') ?></td>
+                <td style="text-align:right;"><?= number_format($cargas_detalhe['pessoas']['lat'], 1, ',', '.') ?></td>
+                <td style="text-align:right; font-weight:600;"><?= number_format($cargas_detalhe['pessoas']['total'], 1, ',', '.') ?></td>
+            </tr>
+            <tr>
+                <td>💡 Iluminação</td>
+                <td style="text-align:right;"><?= number_format($cargas_detalhe['iluminacao']['sens'], 1, ',', '.') ?></td>
+                <td style="text-align:right;"><?= number_format($cargas_detalhe['iluminacao']['lat'], 1, ',', '.') ?></td>
+                <td style="text-align:right; font-weight:600;"><?= number_format($cargas_detalhe['iluminacao']['total'], 1, ',', '.') ?></td>
+            </tr>
+            <tr>
+                <td>⚡ Equipamentos</td>
+                <td style="text-align:right;"><?= number_format($cargas_detalhe['equipamentos']['sens'], 1, ',', '.') ?></td>
+                <td style="text-align:right;"><?= number_format($cargas_detalhe['equipamentos']['lat'], 1, ',', '.') ?></td>
+                <td style="text-align:right; font-weight:600;"><?= number_format($cargas_detalhe['equipamentos']['total'], 1, ',', '.') ?></td>
+            </tr>
+            <?php endif; ?>
+        </tbody>
+        <tfoot>
+            <tr>
+                <td>TOTAL DO AMBIENTE</td>
+                <td style="text-align:right; color:#0891b2;"><?= number_format($Q_sensivel_total, 1, ',', '.') ?> W</td>
+                <td style="text-align:right; color:#0891b2;"><?= number_format($Q_latente_total, 1, ',', '.') ?> W</td>
+                <td style="text-align:right; color:#0891b2; font-size:1.1rem;"><?= number_format($Q_total, 1, ',', '.') ?> W</td>
+            </tr>
+        </tfoot>
+    </table>
+</div>
+
+<!-- ============================================================ -->
+<!-- INDICADORES TÉCNICOS -->
+<!-- ============================================================ -->
+<div class="form-card">
+    <h2>📈 Indicadores Técnicos</h2>
+    
+    <div class="card-grid">
+        <div class="card" style="border-left:4px solid <?= $shr_status['cor'] ?>;">
+            <div class="card-label" style="color:<?= $shr_status['cor'] ?>;">SHR — Fator de Calor Sensível</div>
+            <div class="card-valor" style="color:<?= $shr_status['cor'] ?>;">
+                <?= number_format($SHR, 2, ',', '.') ?>
+            </div>
+            <div class="card-sub"><?= $shr_status['texto'] ?></div>
+        </div>
+        
+        <div class="card" style="border-left:4px solid #0ea5e9;">
+            <div class="card-label" style="color:#0369a1;">VAZÃO DE AR NECESSÁRIA</div>
+            <div class="card-valor" style="color:#0369a1;">
+                <?= number_format($vazao_m3_h, 0, ',', '.') ?> m³/h
+            </div>
+            <div class="card-sub">baseado em ΔT_ar = <?= number_format($delta_T_ar, 0, ',', '.') ?> °C</div>
+        </div>
+        
+        <div class="card" style="border-left:4px solid #8b5cf6;">
+            <div class="card-label" style="color:#5b21b6;">Q BRUTO</div>
+            <div class="card-valor" style="color:#5b21b6;">
+                <?= number_format($Q_total, 0, ',', '.') ?> W
+            </div>
+            <div class="card-sub">
+                <?= number_format($Q_total / 3517, 2, ',', '.') ?> TR
+            </div>
+        </div>
+        
+        <div class="card" style="border-left:4px solid #f59e0b;">
+            <div class="card-label" style="color:#92400e;">MARGEM DE SEGURANÇA</div>
+            <div class="card-valor" style="color:#92400e;">
+                +<?= number_format($margem_seguranca * 100, 0) ?>%
+            </div>
+            <div class="card-sub">
+                +<?= number_format($margem_w, 0, ',', '.') ?> W
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- ============================================================ -->
+<!-- CAPACIDADE RECOMENDADA -->
+<!-- ============================================================ -->
+<div class="destaque">
+    <h3>🎯 Capacidade Recomendada</h3>
+    <div class="valor">
+        <?= number_format($BTU_h, 0, ',', '.') ?> BTU/h
+    </div>
+    <div class="sub">
+        <?= number_format($TR, 2, ',', '.') ?> TR ·
+        <?= number_format($Q_com_margem, 0, ',', '.') ?> W (com margem)
+    </div>
+</div>
+
+<div class="form-card">
+    <h2>❄️ Equipamento Sugerido</h2>
+    
+    <div style="display:flex; align-items:center; gap:16px; padding:20px; background:#f0fdfa; border-radius:8px; border-left:4px solid #14b8a6;">
+        <div style="font-size:2.5rem;">❄️</div>
+        <div>
+            <div style="font-size:1.3rem; font-weight:800; color:#0f766e;">
+                <?= htmlspecialchars($equip_nome) ?>
+            </div>
+            <div style="font-size:0.85rem; color:#64748b; margin-top:4px;">
+                Capacidade comercial mais próxima acima de <?= number_format($BTU_h, 0, ',', '.') ?> BTU/h
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- ============================================================ -->
+<!-- RESUMO -->
+<!-- ============================================================ -->
+<div class="resumo-box">
+    <h2 style="border:none; margin-bottom:16px; color:#0e7490;">📋 Resumo do Dimensionamento</h2>
+    
+    <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(180px, 1fr)); gap:16px;">
+        <div style="background:#fff; padding:14px; border-radius:8px;">
+            <div style="font-size:0.75rem; color:#0891b2; font-weight:700; text-transform:uppercase;">CARGA TOTAL</div>
+            <div style="font-size:1.4rem; color:#0891b2; font-weight:800; margin-top:4px;">
+                <?= number_format($Q_total, 0, ',', '.') ?> W
+            </div>
+        </div>
+        <div style="background:#fff; padding:14px; border-radius:8px;">
+            <div style="font-size:0.75rem; color:#dc2626; font-weight:700; text-transform:uppercase;">CARGA + MARGEM</div>
+            <div style="font-size:1.4rem; color:#dc2626; font-weight:800; margin-top:4px;">
+                <?= number_format($Q_com_margem, 0, ',', '.') ?> W
+            </div>
+        </div>
+        <div style="background:#fff; padding:14px; border-radius:8px;">
+            <div style="font-size:0.75rem; color:#7c3aed; font-weight:700; text-transform:uppercase;">CAPACIDADE (BTU/h)</div>
+            <div style="font-size:1.4rem; color:#7c3aed; font-weight:800; margin-top:4px;">
+                <?= number_format($BTU_h, 0, ',', '.') ?>
+            </div>
+        </div>
+        <div style="background:#fff; padding:14px; border-radius:8px;">
+            <div style="font-size:0.75rem; color:#059669; font-weight:700; text-transform:uppercase;">EQUIPAMENTO</div>
+            <div style="font-size:1.1rem; color:#059669; font-weight:800; margin-top:4px;">
+                <?= htmlspecialchars($equip_nome) ?>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- ============================================================ -->
+<!-- BOTÕES -->
+<!-- ============================================================ -->
+<form method="POST">
+    <input type="hidden" name="salvar_dimensionamento" value="1">
+    
+    <div class="botoes">
+        <a href="ambiente_cargas_internas.php?projeto_id=<?= $projeto_id ?>&ambiente_id=<?= $ambiente_id ?>" class="btn btn-voltar">
+            ← Voltar ao Passo 4
+        </a>
+        <div style="display:flex; gap:12px; margin-left:auto; flex-wrap:wrap;">
+            <button type="submit" name="salvar_apenas" value="1" class="btn btn-salvar">
+                💾 Salvar
+            </button>
+            <button type="submit" name="prosseguir" value="1" class="btn btn-proximo">
+                Salvar e Prosseguir → Resultado
+            </button>
+        </div>
+    </div>
+</form>
+
+</body>
+</html>

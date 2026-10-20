@@ -1,0 +1,14 @@
+# Configurações sensíveis (NUNCA subir para o GitHub)
+config/config.php
+
+# Backups (são muitos e pesados)
+_backups_*/
+backup_*/
+*.tar.gz
+*.sql
+*.bak_*
+
+# Logs e arquivos temporários
+*.log
+.DS_Store
+Thumbs.db

@@ -1,0 +1,543 @@
+<?php
+error_reporting(E_ALL);
+ini_set('display_errors', 1);
+include __DIR__ . "/../config/config.php";
+
+$projeto_id = (int)($_GET['projeto_id'] ?? 0);
+$ambiente_id = (int)($_GET['ambiente_id'] ?? 0);
+if (!$projeto_id || !$ambiente_id) { header("Location: residencial_ambiente.php"); exit; }
+
+$proj = $conn->query("SELECT * FROM projetos WHERE id = $projeto_id")->fetch_assoc();
+$amb = $conn->query("SELECT * FROM ambientes WHERE id = $ambiente_id AND projeto_id = $projeto_id")->fetch_assoc();
+if (!$proj || !$amb) { header("Location: residencial_ambiente.php?projeto_id=$projeto_id"); exit; }
+
+function val($arr, $chave, $padrao = '') {
+    return isset($arr[$chave]) ? $arr[$chave] : $padrao;
+}
+
+// ============================================================
+// FUNÇÕES PSICROMÉTRICAS (ASHRAE Fundamentals)
+// ============================================================
+
+function pressaoSaturacao($tbs_c) {
+    return exp(23.1964 - 3816.44 / ($tbs_c + 227.02));
+}
+
+function umidadeAbsoluta($tbs_c, $ur, $patm = 101.325) {
+    $psat = pressaoSaturacao($tbs_c);
+    $pv = ($ur / 100) * $psat;
+    return 0.622 * $pv / ($patm - $pv);
+}
+
+function entalpia($tbs_c, $W) {
+    return 1.006 * $tbs_c + $W * (2501 + 1.86 * $tbs_c);
+}
+
+function volumeEspecifico($tbs_c, $W, $patm = 101.325) {
+    return 0.287 * ($tbs_c + 273.15) * (1 + 1.6078 * $W) / $patm;
+}
+
+function tempOrvalho($tbs_c, $ur) {
+    $alpha = log($ur / 100) + (17.27 * $tbs_c) / (237.7 + $tbs_c);
+    return (237.7 * $alpha) / (17.27 - $alpha);
+}
+
+function densidadeAr($tbs_c, $W, $patm = 101.325) {
+    return (1 + $W) / volumeEspecifico($tbs_c, $W, $patm);
+}
+
+// ============================================================
+// CONSTANTES
+// ============================================================
+$IRRADIACAO_SOLAR = [
+    'Norte' => 450, 'Nordeste' => 440, 'Leste' => 500, 'Sudeste' => 380,
+    'Sul' => 180, 'Sudoeste' => 450, 'Oeste' => 620, 'Noroeste' => 550,
+];
+
+$SHGC_VIDRO = [
+    'comum' => 0.86, 'duplo' => 0.70, 'low_e' => 0.40,
+    'temperado' => 0.80, 'laminado' => 0.75, 'refletivo' => 0.35,
+];
+
+$COEF_U_MATERIAIS = [
+    'Tijolo cerâmico 1/2 vez' => 2.40, 'Tijolo cerâmico 1 vez' => 1.70,
+    'Bloco de concreto' => 2.80, 'Concreto maciço' => 3.50,
+    'Madeira' => 0.60, 'Drywall' => 1.80, 'Vidro' => 5.80, 'Outro' => 2.00,
+];
+
+$EQUIPAMENTOS_COMERCIAIS = [
+    7000, 9000, 10000, 12000, 15000, 18000, 22000, 24000, 30000, 36000, 48000
+];
+
+$CLTD_TABELA = [
+    'Norte' => [5, 6, 7], 'Nordeste' => [7, 9, 11],
+    'Leste' => [9, 11, 13], 'Sudeste' => [6, 8, 9],
+    'Sul' => [4, 4, 5], 'Sudoeste' => [8, 10, 12],
+    'Oeste' => [11, 13, 16], 'Noroeste' => [9, 11, 13],
+];
+
+// ============================================================
+// DADOS DO PROJETO
+// ============================================================
+$temp_ext = (float)val($proj, 'temp_externa_verao', 30.0);
+$temp_int = (float)val($proj, 'temp_interna_verao', 23.0);
+$ur_ext = (float)val($proj, 'ur_externa_verao', 60.0);
+$ur_int = (float)val($proj, 'ur_interna_verao', 55.0);
+$delta_T = $temp_ext - $temp_int;
+
+$temp_insufl = $temp_int - 12.0;
+$temp_retorno = $temp_int;
+$delta_T_ar = $temp_retorno - $temp_insufl;
+
+// PSICROMETRIA
+$W_ext = umidadeAbsoluta($temp_ext, $ur_ext);
+$W_int = umidadeAbsoluta($temp_int, $ur_int);
+$h_ext = entalpia($temp_ext, $W_ext);
+$h_int = entalpia($temp_int, $W_int);
+$rho_ext = densidadeAr($temp_ext, $W_ext);
+$rho_int = densidadeAr($temp_int, $W_int);
+$T_orvalho_ext = tempOrvalho($temp_ext, $ur_ext);
+$delta_h = $h_ext - $h_int;
+
+// ============================================================
+// DADOS DO AMBIENTE
+// ============================================================
+$comp_amb = (float)val($amb, 'comprimento_m', 0);
+$larg_amb = (float)val($amb, 'largura_m', 0);
+$pe_direito = (float)val($amb, 'peDireita_m', 2.8);
+$area_ambiente = $comp_amb * $larg_amb;
+$volume_ambiente = $area_ambiente * $pe_direito;
+
+$mensagem_sucesso = '';
+
+// ============================================================
+// 1. PAREDES (CLTD)
+// ============================================================
+$Q_paredes_cond = 0;
+$Q_paredes_rad = 0;
+$paredes = [];
+
+$res_p = $conn->query("SELECT * FROM paredes_ambiente WHERE ambiente_id = $ambiente_id");
+while ($p = $res_p->fetch_assoc()) {
+    $comp = (float)($p['comprimento_m'] ?? 0);
+    $alt = (float)($p['altura_m'] ?? 0);
+    if ($comp <= 0 || $alt <= 0) continue;
+
+    $area = $comp * $alt;
+    $U = $COEF_U_MATERIAIS[$p['material']] ?? 2.0;
+    $q_cond = $U * $area * $delta_T;
+
+    $idx_cor = 0;
+    if (($p['cor_externa'] ?? 'Clara') === 'Média') $idx_cor = 1;
+    elseif (($p['cor_externa'] ?? 'Clara') === 'Escura') $idx_cor = 2;
+    $CLTD = $CLTD_TABELA[$p['nome']][$idx_cor] ?? 8;
+    $q_rad = $U * $area * $CLTD;
+
+    $Q_paredes_cond += $q_cond;
+    $Q_paredes_rad += $q_rad;
+
+    $paredes[] = ['nome' => $p['nome'], 'area' => $area, 'q_cond' => $q_cond, 'q_rad' => $q_rad];
+}
+
+// ============================================================
+// 2. JANELAS (SHGC)
+// ============================================================
+$Q_janelas_cond = 0;
+$Q_janelas_rad = 0;
+$vazao_infiltracao_m3h = 0;
+$janelas = [];
+
+$config_solar = [];
+$res_gs = $conn->query("SELECT * FROM ganho_solar WHERE ambiente_id = $ambiente_id");
+while ($gs = $res_gs->fetch_assoc()) {
+    $config_solar[(int)$gs['item_id']] = $gs;
+}
+
+$res_i = $conn->query("
+    SELECT ip.*, pa.nome AS orientacao_parede
+    FROM itens_parede ip
+    JOIN paredes_ambiente pa ON pa.id = ip.parede_id
+    WHERE pa.ambiente_id = $ambiente_id
+");
+while ($it = $res_i->fetch_assoc()) {
+    $larg = (float)($it['largura_m'] ?? 0);
+    $alt = (float)($it['altura_m'] ?? 0);
+    $area = $larg * $alt;
+    if ($area <= 0) continue;
+
+    $orientacao = $it['orientacao_parede'] ?? 'Norte';
+    $I = $IRRADIACAO_SOLAR[$orientacao] ?? 400;
+
+    $cfg = $config_solar[(int)$it['id']] ?? null;
+    $tipo_vidro = $cfg['tipo_vidro'] ?? 'comum';
+    $fator_sombra = (float)($cfg['fator_sombra'] ?? 1.0);
+
+    $shgc = $SHGC_VIDRO[$tipo_vidro] ?? 0.86;
+    $U_vidro = 5.8;
+
+    $q_cond = $U_vidro * $area * $delta_T;
+    $q_rad = $area * $shgc * $I * $fator_sombra;
+
+    $Q_janelas_cond += $q_cond;
+    $Q_janelas_rad += $q_rad;
+
+    $coef_inf = (float)($it['coef_infiltracao'] ?? 0);
+    $metodo = $it['metodo_coef'] ?? 'ren/h';
+    $vazao_item = 0;
+    if ($metodo === 'ren/h' && $coef_inf > 0) {
+        $vazao_item = $coef_inf * $volume_ambiente;
+    } elseif ($metodo === 'm³/(h·m)' && $coef_inf > 0) {
+        $vazao_item = $coef_inf * (float)($it['comprimento_fresta_m'] ?? 0);
+    }
+    $vazao_infiltracao_m3h += $vazao_item;
+
+    $janelas[] = [
+        'nome' => $it['nome_item'], 'orientacao' => $orientacao, 'area' => $area,
+        'q_cond' => $q_cond, 'q_rad' => $q_rad, 'vazao_item' => $vazao_item,
+    ];
+}
+
+// ============================================================
+// 3. INFILTRAÇÃO POR ENTALPIA
+// ============================================================
+error_log("DEBUG_INF vazao=" . $vazao_infiltracao_m3h . " rho_ext=" . $rho_ext . " delta_T=" . $delta_T . " m_ar=" . $m_ar_inf);
+error_log("DEBUG_INF vazao=" . $vazao_infiltracao_m3h . " rho_ext=" . $rho_ext . " delta_T=" . $delta_T . " m_ar=" . $m_ar_inf);
+$m_ar_inf = ($vazao_infiltracao_m3h / 3600) * $rho_ext;
+$Q_infiltracao_total_w = $m_ar_inf * $delta_h * 1000;
+$cp_ar = 1.006;
+$Q_inf_sens = $m_ar_inf * $cp_ar * $delta_T * 1000;
+$Q_inf_lat = $Q_infiltracao_total_w - $Q_inf_sens;
+if ($Q_inf_lat < 0) $Q_inf_lat = 0;
+
+// ============================================================
+// 4. CARGAS INTERNAS
+// ============================================================
+$ci = $conn->query("SELECT * FROM cargas_internas WHERE ambiente_id = $ambiente_id LIMIT 1")->fetch_assoc();
+$Q_int_sens = 0;
+$Q_int_lat = 0;
+$cargas_detalhe = [];
+
+if ($ci) {
+    $q_pessoas = (int)($ci['pessoas'] ?? 0) * (float)($ci['calor_por_pessoa_w'] ?? 115) * (float)($ci['fator_simultaneidade_pessoas'] ?? 0.90);
+    $q_pessoas_sens = $q_pessoas * 0.55;
+    $q_pessoas_lat = $q_pessoas * 0.45;
+
+    $q_ilum = (float)($ci['potencia_iluminacao_w'] ?? 0) * (float)($ci['fator_simultaneidade_iluminacao'] ?? 1.0);
+
+    $q_equip = (float)($ci['potencia_equipamentos_w'] ?? 0) * (float)($ci['fator_simultaneidade_equipamentos'] ?? 0.70);
+    $q_equip_sens = $q_equip * 0.70;
+    $q_equip_lat = $q_equip * 0.30;
+
+    $Q_int_sens = $q_pessoas_sens + $q_ilum + $q_equip_sens;
+    $Q_int_lat = $q_pessoas_lat + $q_equip_lat;
+
+    $cargas_detalhe = [
+        'pessoas' => ['sens' => $q_pessoas_sens, 'lat' => $q_pessoas_lat, 'total' => $q_pessoas],
+        'iluminacao' => ['sens' => $q_ilum, 'lat' => 0, 'total' => $q_ilum],
+        'equipamentos' => ['sens' => $q_equip_sens, 'lat' => $q_equip_lat, 'total' => $q_equip],
+    ];
+}
+
+// ============================================================
+// 5. BALANÇO
+// ============================================================
+error_log("DEBUG_BALANCO paredes_cond=" . $Q_paredes_cond . " paredes_rad=" . $Q_paredes_rad . " janelas_cond=" . $Q_janelas_cond . " janelas_rad=" . $Q_janelas_rad . " inf_sens=" . $Q_inf_sens . " int_sens=" . $Q_int_sens);
+$Q_sensivel_total = $Q_paredes_cond + $Q_paredes_rad + $Q_janelas_cond + $Q_janelas_rad + $Q_inf_sens + $Q_int_sens;
+$Q_sensivel_total = abs($Q_sensivel_total);
+$Q_latente_total = abs($Q_latente_total);
+$Q_total = abs($Q_total);
+$Q_latente_total = $Q_inf_lat + $Q_int_lat;
+$Q_total = $Q_sensivel_total + $Q_latente_total;
+$SHR = $Q_total > 0 ? $Q_sensivel_total / $Q_total : 1.0;
+
+// ============================================================
+// 6. VAZÃO DE AR
+// ============================================================
+$m_ar_soprado = $delta_T_ar > 0 ? $Q_sensivel_total / ($cp_ar * $delta_T_ar * 1000) : 0;
+$vazao_ar_m3h = $m_ar_soprado * 3600 / $rho_int;
+
+// ============================================================
+// 7. CAPACIDADE
+// ============================================================
+$margem_seguranca = 0.10;
+$Q_com_margem = $Q_total * (1 + $margem_seguranca);
+$margem_w = $Q_com_margem - $Q_total;
+$BTU_h = $Q_com_margem * 3.412;
+$TR = $Q_com_margem / 3517;
+
+$equip_sugerido = end($EQUIPAMENTOS_COMERCIAIS);
+foreach ($EQUIPAMENTOS_COMERCIAIS as $cap) {
+    if ($cap >= $BTU_h) { $equip_sugerido = $cap; break; }
+}
+$equip_nome = "Split " . number_format($equip_sugerido, 0, ',', '.') . " BTU/h";
+
+$SHR_equip = 0.75;
+$SHR_atende = ($SHR >= $SHR_equip);
+
+if ($SHR >= 0.90) $shr_status = ['texto' => 'Muito Seco', 'cor' => '#f59e0b'];
+elseif ($SHR >= 0.80) $shr_status = ['texto' => 'Ideal', 'cor' => '#10b981'];
+elseif ($SHR >= 0.70) $shr_status = ['texto' => 'Úmido — OK', 'cor' => '#10b981'];
+else $shr_status = ['texto' => 'Muito Úmido', 'cor' => '#ef4444'];
+
+// ============================================================
+// SALVAR POST
+// ============================================================
+if ($_SERVER["REQUEST_METHOD"] === "POST" && !empty($_POST['salvar_dimensionamento'])) {
+    $conn->query("DELETE FROM resultados_calculo WHERE ambiente_id = $ambiente_id AND projeto_id = $projeto_id");
+
+    $stmt = $conn->prepare("INSERT INTO resultados_calculo 
+        (projeto_id, ambiente_id, carga_conducao_w, carga_solar_w, carga_interna_w,
+         carga_ventilacao_w, carga_bruta_w, margem_seguranca_w, carga_total_w,
+         carga_sensivel_w, carga_latente_w, shr, vazao_ar_m3h,
+         carga_total_btu, aparelho_recomendado, delta_t_c, volume_m3)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+
+    $q_conducao = $Q_paredes_cond + $Q_janelas_cond;
+    $q_solar = $Q_paredes_rad + $Q_janelas_rad;
+    $q_interna = $Q_int_sens + $Q_int_lat;
+    $q_ventilacao = $Q_infiltracao_total_w;
+    $q_bruta = $Q_total;
+    $q_total_final = $Q_com_margem;
+
+    // 17 tipos: ii + 12d + s + 2d
+    $tipos_bind = "ii" . str_repeat("d", 12) . "s" . "dd";
+
+    $stmt->bind_param($tipos_bind,
+        $projeto_id, $ambiente_id,
+        $q_conducao, $q_solar, $q_interna, $q_ventilacao,
+        $q_bruta, $margem_w, $q_total_final,
+        $Q_sensivel_total, $Q_latente_total, $SHR, $vazao_ar_m3h,
+        $BTU_h, $equip_nome, $delta_T, $volume_ambiente
+    );
+
+    if (!$stmt->execute()) {
+        error_log("Erro INSERT: " . $stmt->error);
+    }
+
+    if (empty($_POST['salvar_apenas'])) {
+        header("Location: ambiente_resultado.php?projeto_id=$projeto_id&ambiente_id=$ambiente_id");
+        exit;
+    } else {
+        $mensagem_sucesso = "Dimensionamento psicrométrico salvo!";
+    }
+}
+?>
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Passo 5 — Dimensionamento</title>
+<style>
+* { box-sizing:border-box; font-family:system-ui,sans-serif; margin:0; padding:0; }
+body { background:#f0f4f8; padding:20px; max-width:1200px; margin:0 auto; }
+.barra-progresso { display:flex; justify-content:space-between; margin-bottom:24px; }
+.passo-link { flex:1; text-align:center; font-size:0.75rem; color:#94a3b8; border-bottom:2px solid #e2e8f0; padding-bottom:8px; text-decoration:none; }
+.passo-link.ativo { color:#06b6d4; border-bottom:3px solid #06b6d4; font-weight:700; }
+.passo-link.concluido { color:#2563eb; border-bottom:2px solid #bfdbfe; }
+.cabecalho { background:#fff; padding:24px; border-radius:12px; box-shadow:0 2px 8px rgba(0,0,0,0.05); margin-bottom:24px; }
+h1 { font-size:1.3rem; color:#1e293b; margin-bottom:5px; }
+h2 { font-size:1.1rem; color:#334155; margin-bottom:16px; padding-bottom:8px; border-bottom:2px solid #e2e8f0; }
+.subtitulo { color:#64748b; margin-bottom:12px; }
+.form-card { background:#fff; padding:24px; border-radius:12px; box-shadow:0 2px 8px rgba(0,0,0,0.05); margin-bottom:20px; }
+.btn { padding:12px 24px; border-radius:10px; font-weight:700; text-decoration:none; border:none; cursor:pointer; font-size:0.95rem; display:inline-flex; align-items:center; gap:6px; }
+.btn-voltar { background:#e5e7eb; color:#374151; }
+.btn-proximo { background:linear-gradient(135deg, #06b6d4, #0891b2); color:#fff; }
+.btn-salvar { background:linear-gradient(135deg, #10b981, #059669); color:#fff; }
+.botoes { display:flex; gap:12px; margin-top:24px; justify-content:space-between; padding-top:20px; border-top:2px solid #e2e8f0; flex-wrap:wrap; }
+.aviso-sucesso { background:#d1fae5; border-left:4px solid #10b981; padding:14px 18px; margin-bottom:16px; border-radius:8px; color:#065f46; font-weight:600; }
+table { width:100%; border-collapse:collapse; margin-top:8px; }
+th { background:#f1f5f9; padding:10px 12px; text-align:left; font-weight:700; color:#475569; font-size:0.8rem; text-transform:uppercase; }
+td { padding:10px 12px; border-bottom:1px solid #e2e8f0; font-size:0.9rem; color:#334155; }
+tfoot td { background:#f1f5f9; font-weight:700; color:#0f172a; }
+.card-grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(200px, 1fr)); gap:16px; margin-top:16px; }
+.card { background:#fff; padding:18px; border-radius:8px; box-shadow:0 1px 3px rgba(0,0,0,0.05); }
+.card-label { font-size:0.75rem; font-weight:700; text-transform:uppercase; letter-spacing:0.5px; margin-bottom:6px; }
+.card-valor { font-size:1.6rem; font-weight:800; }
+.card-sub { font-size:0.75rem; color:#64748b; margin-top:4px; }
+.destaque { background:linear-gradient(135deg, #06b6d4, #0891b2); color:#fff; padding:24px; border-radius:12px; text-align:center; margin:24px 0; }
+.destaque h3 { font-size:0.9rem; text-transform:uppercase; letter-spacing:1px; opacity:0.9; margin-bottom:8px; }
+.destaque .valor { font-size:2.2rem; font-weight:800; }
+.destaque .sub { font-size:0.9rem; margin-top:8px; opacity:0.95; }
+.psicro-box { background:#f0fdfa; border-left:4px solid #14b8a6; padding:16px; border-radius:0 8px 8px 0; margin:16px 0; }
+.psicro-grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(150px, 1fr)); gap:12px; margin-top:12px; }
+.psicro-item { background:#fff; padding:12px; border-radius:6px; }
+.psicro-label { font-size:0.7rem; color:#0f766e; text-transform:uppercase; font-weight:700; }
+.psicro-valor { font-size:1.1rem; color:#134e4a; font-weight:700; margin-top:2px; }
+</style>
+</head>
+<body>
+
+<div class="barra-progresso">
+    <a href="ambiente_dados.php?projeto_id=<?= $projeto_id ?>&ambiente_id=<?= $ambiente_id ?>" class="passo-link concluido">✓ 1. Dados</a>
+    <a href="ambiente_paredes.php?projeto_id=<?= $projeto_id ?>&ambiente_id=<?= $ambiente_id ?>" class="passo-link concluido">✓ 2. Paredes</a>
+    <a href="ambiente_ganho_solar.php?projeto_id=<?= $projeto_id ?>&ambiente_id=<?= $ambiente_id ?>" class="passo-link concluido">✓ 3. Solar</a>
+    <a href="ambiente_cargas_internas.php?projeto_id=<?= $projeto_id ?>&ambiente_id=<?= $ambiente_id ?>" class="passo-link concluido">✓ 4. Internas</a>
+    <a class="passo-link ativo">5. Dimensionamento</a>
+    <a class="passo-link">6. Resultado</a>
+</div>
+
+<div class="cabecalho">
+    <a href="ambiente_cargas_internas.php?projeto_id=<?= $projeto_id ?>&ambiente_id=<?= $ambiente_id ?>" style="color:#06b6d4; text-decoration:none; font-weight:600; font-size:0.9rem;">← Voltar ao Passo 4</a>
+
+    <?php if (!empty($mensagem_sucesso)): ?>
+    <div class="aviso-sucesso" style="margin-top:16px;">✅ <?= htmlspecialchars($mensagem_sucesso) ?></div>
+    <?php endif; ?>
+
+    <h1 style="margin-top:16px;">❄️ Dimensionamento Térmico — Psicrométrico</h1>
+    <p class="subtitulo">
+        Ambiente: <strong><?= htmlspecialchars(val($amb, 'nome')) ?></strong>
+        · Área: <?= number_format($area_ambiente, 1, ',', '.') ?> m²
+        · Volume: <?= number_format($volume_ambiente, 1, ',', '.') ?> m³
+    </p>
+</div>
+
+<div class="form-card">
+    <h2>💧 Estado Psicrométrico do Ar</h2>
+
+    <div class="psicro-box">
+        <strong>Ar Externo:</strong> TBS <?= number_format($temp_ext, 1, ',', '.') ?>°C · UR <?= number_format($ur_ext, 0) ?>%
+        <div class="psicro-grid">
+            <div class="psicro-item">
+                <div class="psicro-label">Umidade Absoluta</div>
+                <div class="psicro-valor"><?= number_format($W_ext * 1000, 2, ',', '.') ?> g/kg</div>
+            </div>
+            <div class="psicro-item">
+                <div class="psicro-label">Entalpia</div>
+                <div class="psicro-valor"><?= number_format($h_ext, 2, ',', '.') ?> kJ/kg</div>
+            </div>
+            <div class="psicro-item">
+                <div class="psicro-label">Densidade</div>
+                <div class="psicro-valor"><?= number_format($rho_ext, 3, ',', '.') ?> kg/m³</div>
+            </div>
+            <div class="psicro-item">
+                <div class="psicro-label">T. Orvalho</div>
+                <div class="psicro-valor"><?= number_format($T_orvalho_ext, 1, ',', '.') ?> °C</div>
+            </div>
+        </div>
+    </div>
+
+    <div class="psicro-box" style="background:#eff6ff; border-left-color:#3b82f6;">
+        <strong>Ar Interno:</strong> TBS <?= number_format($temp_int, 1, ',', '.') ?>°C · UR <?= number_format($ur_int, 0) ?>%
+        <div class="psicro-grid">
+            <div class="psicro-item">
+                <div class="psicro-label" style="color:#1e40af;">Umidade Absoluta</div>
+                <div class="psicro-valor" style="color:#1e3a8a;"><?= number_format($W_int * 1000, 2, ',', '.') ?> g/kg</div>
+            </div>
+            <div class="psicro-item">
+                <div class="psicro-label" style="color:#1e40af;">Entalpia</div>
+                <div class="psicro-valor" style="color:#1e3a8a;"><?= number_format($h_int, 2, ',', '.') ?> kJ/kg</div>
+            </div>
+            <div class="psicro-item">
+                <div class="psicro-label" style="color:#1e40af;">Densidade</div>
+                <div class="psicro-valor" style="color:#1e3a8a;"><?= number_format($rho_int, 3, ',', '.') ?> kg/m³</div>
+            </div>
+            <div class="psicro-item">
+                <div class="psicro-label" style="color:#1e40af;">Δh (Ext-Int)</div>
+                <div class="psicro-valor" style="color:#1e3a8a;"><?= number_format($delta_h, 2, ',', '.') ?> kJ/kg</div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="form-card">
+    <h2>📊 Balanço Térmico Completo</h2>
+    <table>
+        <thead>
+            <tr>
+                <th>Fonte de Calor</th>
+                <th style="text-align:right;">Q_sensível (W)</th>
+                <th style="text-align:right;">Q_latente (W)</th>
+                <th style="text-align:right;">Q_total (W)</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr><td>🧱 Condução — Paredes</td>
+                <td style="text-align:right;"><?= number_format($Q_paredes_cond, 1, ',', '.') ?></td>
+                <td style="text-align:right;">0,0</td>
+                <td style="text-align:right; font-weight:600;"><?= number_format($Q_paredes_cond, 1, ',', '.') ?></td></tr>
+            <tr><td>☀️ Radiação — Paredes (CLTD)</td>
+                <td style="text-align:right;"><?= number_format($Q_paredes_rad, 1, ',', '.') ?></td>
+                <td style="text-align:right;">0,0</td>
+                <td style="text-align:right; font-weight:600;"><?= number_format($Q_paredes_rad, 1, ',', '.') ?></td></tr>
+            <tr><td>🪟 Condução — Janelas</td>
+                <td style="text-align:right;"><?= number_format($Q_janelas_cond, 1, ',', '.') ?></td>
+                <td style="text-align:right;">0,0</td>
+                <td style="text-align:right; font-weight:600;"><?= number_format($Q_janelas_cond, 1, ',', '.') ?></td></tr>
+            <tr><td>☀️ Radiação — Janelas (SHGC)</td>
+                <td style="text-align:right;"><?= number_format($Q_janelas_rad, 1, ',', '.') ?></td>
+                <td style="text-align:right;">0,0</td>
+                <td style="text-align:right; font-weight:600;"><?= number_format($Q_janelas_rad, 1, ',', '.') ?></td></tr>
+            <tr style="background:#f0fdfa;"><td>💨 Infiltração (entalpia)</td>
+                <td style="text-align:right;"><?= number_format($Q_inf_sens, 1, ',', '.') ?></td>
+                <td style="text-align:right;"><?= number_format($Q_inf_lat, 1, ',', '.') ?></td>
+                <td style="text-align:right; font-weight:600;"><?= number_format($Q_infiltracao_total_w, 1, ',', '.') ?></td></tr>
+            <?php if (!empty($cargas_detalhe)): ?>
+            <tr><td>👥 Ocupantes</td>
+                <td style="text-align:right;"><?= number_format($cargas_detalhe['pessoas']['sens'], 1, ',', '.') ?></td>
+                <td style="text-align:right;"><?= number_format($cargas_detalhe['pessoas']['lat'], 1, ',', '.') ?></td>
+                <td style="text-align:right; font-weight:600;"><?= number_format($cargas_detalhe['pessoas']['total'], 1, ',', '.') ?></td></tr>
+            <tr><td>💡 Iluminação</td>
+                <td style="text-align:right;"><?= number_format($cargas_detalhe['iluminacao']['sens'], 1, ',', '.') ?></td>
+                <td style="text-align:right;"><?= number_format($cargas_detalhe['iluminacao']['lat'], 1, ',', '.') ?></td>
+                <td style="text-align:right; font-weight:600;"><?= number_format($cargas_detalhe['iluminacao']['total'], 1, ',', '.') ?></td></tr>
+            <tr><td>⚡ Equipamentos</td>
+                <td style="text-align:right;"><?= number_format($cargas_detalhe['equipamentos']['sens'], 1, ',', '.') ?></td>
+                <td style="text-align:right;"><?= number_format($cargas_detalhe['equipamentos']['lat'], 1, ',', '.') ?></td>
+                <td style="text-align:right; font-weight:600;"><?= number_format($cargas_detalhe['equipamentos']['total'], 1, ',', '.') ?></td></tr>
+            <?php endif; ?>
+        </tbody>
+        <tfoot>
+            <tr><td>TOTAL DO AMBIENTE</td>
+                <td style="text-align:right; color:#0891b2;"><?= number_format($Q_sensivel_total, 1, ',', '.') ?> W</td>
+                <td style="text-align:right; color:#0891b2;"><?= number_format($Q_latente_total, 1, ',', '.') ?> W</td>
+                <td style="text-align:right; color:#0891b2; font-size:1.1rem;"><?= number_format($Q_total, 1, ',', '.') ?> W</td></tr>
+        </tfoot>
+    </table>
+</div>
+
+<div class="form-card">
+    <h2>📈 Indicadores Técnicos</h2>
+    <div class="card-grid">
+        <div class="card" style="border-left:4px solid <?= $shr_status['cor'] ?>;">
+            <div class="card-label" style="color:<?= $shr_status['cor'] ?>;">SHR</div>
+            <div class="card-valor" style="color:<?= $shr_status['cor'] ?>;"><?= number_format($SHR, 3, ',', '.') ?></div>
+            <div class="card-sub"><?= $shr_status['texto'] ?></div>
+        </div>
+        <div class="card" style="border-left:4px solid #0ea5e9;">
+            <div class="card-label" style="color:#0369a1;">VAZÃO DE AR</div>
+            <div class="card-valor" style="color:#0369a1;"><?= number_format($vazao_ar_m3h, 0, ',', '.') ?> m³/h</div>
+            <div class="card-sub">ΔT_ar = <?= number_format($delta_T_ar, 1, ',', '.') ?> °C</div>
+        </div>
+        <div class="card" style="border-left:4px solid #8b5cf6;">
+            <div class="card-label" style="color:#5b21b6;">INFILTRAÇÃO</div>
+            <div class="card-valor" style="color:#5b21b6;"><?= number_format($vazao_infiltracao_m3h, 0, ',', '.') ?> m³/h</div>
+            <div class="card-sub">Δh = <?= number_format($delta_h, 2, ',', '.') ?> kJ/kg</div>
+        </div>
+        <div class="card" style="border-left:4px solid #f59e0b;">
+            <div class="card-label" style="color:#92400e;">SERPENTINA</div>
+            <div class="card-valor" style="color:#92400e;"><?= $SHR_atende ? '✅ OK' : '⚠️ Verificar' ?></div>
+            <div class="card-sub">SHR_equip = <?= number_format($SHR_equip, 2) ?></div>
+        </div>
+    </div>
+</div>
+
+<div class="destaque">
+    <h3>🎯 Capacidade Recomendada</h3>
+    <div class="valor"><?= number_format($BTU_h, 0, ',', '.') ?> BTU/h</div>
+    <div class="sub"><?= number_format($TR, 2, ',', '.') ?> TR · <?= number_format($Q_com_margem, 0, ',', '.') ?> W (com margem +10%)</div>
+</div>
+
+<form method="POST">
+    <input type="hidden" name="salvar_dimensionamento" value="1">
+    <div class="botoes">
+        <a href="ambiente_cargas_internas.php?projeto_id=<?= $projeto_id ?>&ambiente_id=<?= $ambiente_id ?>" class="btn btn-voltar">← Voltar</a>
+        <div style="display:flex; gap:12px; margin-left:auto; flex-wrap:wrap;">
+            <button type="submit" name="salvar_apenas" value="1" class="btn btn-salvar">💾 Salvar</button>
+            <button type="submit" name="prosseguir" value="1" class="btn btn-proximo">Salvar e Prosseguir → Resultado</button>
+        </div>
+    </div>
+</form>
+
+</body>
+</html>
